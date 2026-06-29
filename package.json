@@ -1,0 +1,47 @@
+{
+  "name": "zync-erc20",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "workspaces": [
+    "client",
+    "contracts"
+  ],
+  "scripts": {
+    "chain": "npx hardhat node --config contracts/hardhat.config.cjs",
+    "deploy": "npx hardhat run contracts/scripts/deploy.cjs --network localhost --config contracts/hardhat.config.cjs",
+    "compile": "npx hardhat compile --config contracts/hardhat.config.cjs",
+    "test:contracts": "npx hardhat test --config contracts/hardhat.config.cjs",
+    "dev": "npm run dev -w zync-client",
+    "start": "npm run start -w zync-client",
+    "client:build": "npm run build -w zync-client"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2",
+    "klinecharts": "^10.0.0-beta1",
+    "lightweight-charts": "^5.1.0",
+    "next": "14.2.33",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "viem": "^2.21.19",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@metamask/logo": "^4.0.0",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@rainbow-me/rainbowkit": "^2.2.10",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.5.0",
+    "hardhat": "^2.22.0",
+    "postcss": "^8.5.10",
+    "simple-icons": "^14.15.0",
+    "tailwindcss": "^3.4.17",
+    "tailwind-motionkit": "^1.0.3",
+    "typescript": "~5.6.3"
+  }
+}

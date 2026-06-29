@@ -1,0 +1,20 @@
+node_modules
+dist
+.env
+package-lock.json
+
+# Next.js build output
+client/.next/
+client/out/
+
+# Vite
+client/vite.config.ts.timestamp-*.mjs
+
+# Hardhat
+contracts/cache
+contracts/artifacts
+contracts/typechain-types
+
+# Temp files
+temp_*.txt
+MIGRATION_*.md
