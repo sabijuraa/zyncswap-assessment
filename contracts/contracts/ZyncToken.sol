@@ -1,163 +1,116 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title ZyncVesting — linear token vesting with a cliff
-/// @notice Admin funds the contract with ZYNC and creates vesting schedules for
-///         beneficiaries. Beneficiaries pull their vested tokens via `release()`.
-/// @dev Solvency invariant: the contract's ZYNC balance always covers the sum of
-///      unreleased allocations (`totalCommitted`). A schedule that would break this
-///      cannot be created. This guarantees every beneficiary can always be paid.
-/// @dev Vesting model: nothing before `cliff`; at `cliff` the amount accrued since
-///      `start` unlocks at once; then linear to `start + duration`.
-/// @dev Non-goal (v1): schedules are irrevocable by design. Admin revocation would
-///      reintroduce the trust problem vesting exists to remove.
-contract ZyncVesting is Ownable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
+/// @title ZyncToken — ZYNC utility token
+/// @notice Public mint: send ETH at `mintPriceWei` per one full token (18 decimals).
+///         Owner can treasury-mint, set price, and withdraw sale proceeds.
+///         Holders can burn their own tokens, or an approved amount via allowance.
+/// @dev Price invariant: `mintPriceWei > 0` always, enforced at every write site.
+/// @dev Supply invariant: MAX_SUPPLY caps the lifetime amount minted, tracked by
+///      `totalMinted` (only ever increases). Burning lowers circulating supply but
+///      never restores mintable headroom.
+contract ZyncToken is ERC20, Ownable, ReentrancyGuard {
+    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 10 ** 18;
+    uint256 private constant ONE_TOKEN = 10 ** 18;
 
-    struct Schedule {
-        uint256 total;     // total tokens in this schedule
-        uint256 released;  // amount already claimed
-        uint64 start;      // vesting start timestamp
-        uint64 cliff;      // no tokens claimable before this timestamp
-        uint64 duration;   // full vesting length from `start`
-    }
+    /// @notice Price in wei for one full ZYNC. Held to the > 0 invariant.
+    uint256 public mintPriceWei;
 
-    /// @notice The vested token.
-    IERC20 public immutable token;
+    /// @notice Cumulative tokens ever minted; only increases, unaffected by burns.
+    uint256 public totalMinted;
 
-    /// @notice Schedules per beneficiary (a beneficiary may hold several grants).
-    mapping(address => Schedule[]) private _schedules;
+    error CapExceeded();
+    error ZeroPrice();
+    error NoPaymentSent();
+    error MintAmountZero();
+    error RefundFailed();
+    error WithdrawFailed();
+    error DirectPaymentRejected();
 
-    /// @notice Sum of all unreleased allocations. The contract balance must always
-    ///         cover this; it is the solvency invariant made explicit.
-    uint256 public totalCommitted;
+    event Burned(address indexed from, uint256 amount);
+    event MintPriceUpdated(uint256 previousPrice, uint256 newPrice);
+    event TreasuryMinted(address indexed to, uint256 amount);
+    event ProceedsWithdrawn(address indexed to, uint256 amount);
 
-    error ZeroAddress();
-    error ZeroAmount();
-    error InvalidSchedule();
-    error InsufficientFunds();   // allocation would exceed funded, unallocated balance
-    error NothingToRelease();
-    error NoSuchSchedule();
-
-    event ScheduleCreated(
-        address indexed beneficiary,
-        uint256 indexed scheduleId,
-        uint256 total,
-        uint64 start,
-        uint64 cliff,
-        uint64 duration
-    );
-    event Released(address indexed beneficiary, uint256 indexed scheduleId, uint256 amount);
-    event Funded(address indexed from, uint256 amount);
-
-    constructor(IERC20 vestedToken) Ownable(msg.sender) {
-        if (address(vestedToken) == address(0)) revert ZeroAddress();
-        token = vestedToken;
-    }
-
-    /// @notice Deposit ZYNC into the contract to back future schedules.
-    /// @dev Caller must have approved this contract for `amount` first.
-    function fund(uint256 amount) external {
-        if (amount == 0) revert ZeroAmount();
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        emit Funded(msg.sender, amount);
-    }
-
-    /// @notice Create a vesting schedule for `beneficiary`.
-    /// @dev Reverts unless the contract holds enough unallocated tokens to fully
-    ///      back this schedule, preserving the solvency invariant.
-    function createSchedule(
-        address beneficiary,
-        uint256 amount,
-        uint64 start,
-        uint64 cliff,
-        uint64 duration
-    ) external onlyOwner returns (uint256 scheduleId) {
-        if (beneficiary == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
-        // duration must be positive; cliff must sit within [start, start+duration].
-        if (duration == 0 || cliff < start || cliff > start + duration) revert InvalidSchedule();
-
-        // Solvency: unallocated balance = held tokens - already committed. The new
-        // allocation must fit inside it, so every schedule stays fully backed.
-        uint256 unallocated = token.balanceOf(address(this)) - totalCommitted;
-        if (amount > unallocated) revert InsufficientFunds();
-
-        totalCommitted += amount; // effect: commit before handing back the id
-
-        scheduleId = _schedules[beneficiary].length;
-        _schedules[beneficiary].push(
-            Schedule({ total: amount, released: 0, start: start, cliff: cliff, duration: duration })
-        );
-
-        emit ScheduleCreated(beneficiary, scheduleId, amount, start, cliff, duration);
-    }
-
-    /// @notice Claim all currently-vested, unreleased tokens for one schedule.
-    /// @dev CEI: compute -> update released/totalCommitted -> transfer. nonReentrant
-    ///      is defense in depth on top of that ordering.
-    function release(uint256 scheduleId) external nonReentrant {
-        Schedule[] storage list = _schedules[msg.sender];
-        if (scheduleId >= list.length) revert NoSuchSchedule();
-
-        Schedule storage s = list[scheduleId];
-        uint256 releasable = _vestedAmount(s, block.timestamp) - s.released;
-        if (releasable == 0) revert NothingToRelease();
-
-        // EFFECTS first: mark released and free the commitment before transferring.
-        s.released += releasable;
-        totalCommitted -= releasable;
-
-        // INTERACTION last.
-        token.safeTransfer(msg.sender, releasable);
-        emit Released(msg.sender, scheduleId, releasable);
-    }
-
-    // --- views ---------------------------------------------------------------
-
-    /// @notice Tokens claimable right now for a beneficiary's schedule.
-    function releasable(address beneficiary, uint256 scheduleId) external view returns (uint256) {
-        Schedule[] storage list = _schedules[beneficiary];
-        if (scheduleId >= list.length) return 0;
-        Schedule storage s = list[scheduleId];
-        return _vestedAmount(s, block.timestamp) - s.released;
-    }
-
-    /// @notice Number of schedules a beneficiary holds.
-    function scheduleCount(address beneficiary) external view returns (uint256) {
-        return _schedules[beneficiary].length;
-    }
-
-    /// @notice Read a schedule.
-    function getSchedule(address beneficiary, uint256 scheduleId)
-        external
-        view
-        returns (Schedule memory)
+    constructor(uint256 initialMintPriceWei)
+        ERC20("Zync", "ZYNC")
+        Ownable(msg.sender)
     {
-        if (scheduleId >= _schedules[beneficiary].length) revert NoSuchSchedule();
-        return _schedules[beneficiary][scheduleId];
+        if (initialMintPriceWei == 0) revert ZeroPrice();
+        mintPriceWei = initialMintPriceWei;
+        emit MintPriceUpdated(0, initialMintPriceWei);
     }
 
-    // --- internal vesting math ----------------------------------------------
+    function setMintPrice(uint256 newPriceWei) external onlyOwner {
+        if (newPriceWei == 0) revert ZeroPrice();
+        uint256 previous = mintPriceWei;
+        mintPriceWei = newPriceWei;
+        emit MintPriceUpdated(previous, newPriceWei);
+    }
 
-    /// @dev Total vested by `timestamp`: 0 before cliff, `total` after the end,
-    ///      linear in between. Multiply before divide to preserve precision.
-    function _vestedAmount(Schedule storage s, uint256 timestamp) private view returns (uint256) {
-        if (timestamp < s.cliff) {
-            return 0;
+    /// @notice Tokens that may still be minted over the contract's lifetime.
+    function remainingMintable() public view returns (uint256) {
+        return MAX_SUPPLY - totalMinted;
+    }
+
+    /// @notice Treasury / airdrop mint. Counts against the lifetime cap.
+    function mintTo(address to, uint256 amount) external onlyOwner {
+        _mintCapped(to, amount);
+        emit TreasuryMinted(to, amount);
+    }
+
+    /// @notice Buy ZYNC with native ETH at the current price.
+    /// @dev Checks-effects-interactions; nonReentrant is defense in depth.
+    function mintWithEth() external payable nonReentrant {
+        if (msg.value == 0) revert NoPaymentSent();
+
+        uint256 tokenAmount = (msg.value * ONE_TOKEN) / mintPriceWei;
+        if (tokenAmount == 0) revert MintAmountZero();
+
+        uint256 costWei = (tokenAmount * mintPriceWei) / ONE_TOKEN;
+
+        _mintCapped(msg.sender, tokenAmount);
+
+        uint256 refund = msg.value - costWei;
+        if (refund > 0) {
+            (bool ok, ) = payable(msg.sender).call{value: refund}("");
+            if (!ok) revert RefundFailed();
         }
-        uint256 end = uint256(s.start) + s.duration;
-        if (timestamp >= end) {
-            return s.total;
-        }
-        // elapsed is measured from start (not cliff): the cliff gates *when* tokens
-        // become claimable, but the linear schedule accrues from start.
-        uint256 elapsed = timestamp - s.start;
-        return (s.total * elapsed) / s.duration;
+    }
+
+    /// @notice Burn the caller's own tokens.
+    function burn(uint256 amount) external {
+        _burn(msg.sender, amount);
+        emit Burned(msg.sender, amount);
+    }
+
+    /// @notice Burn `amount` from `account`, spending the caller's allowance.
+    function burnFrom(address account, uint256 amount) external {
+        _spendAllowance(account, msg.sender, amount);
+        _burn(account, amount);
+        emit Burned(account, amount);
+    }
+
+    function withdraw() external onlyOwner nonReentrant {
+        uint256 amount = address(this).balance;
+        (bool ok, ) = payable(owner()).call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit ProceedsWithdrawn(owner(), amount);
+    }
+
+    /// @dev Reject bare ETH: all purchases must route through mintWithEth.
+    receive() external payable {
+        revert DirectPaymentRejected();
+    }
+
+    /// @dev Single choke point for all minting. Caps against `totalMinted`.
+    function _mintCapped(address to, uint256 amount) private {
+        if (totalMinted + amount > MAX_SUPPLY) revert CapExceeded();
+        totalMinted += amount;
+        _mint(to, amount);
     }
 }
