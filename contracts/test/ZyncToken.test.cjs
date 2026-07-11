@@ -72,8 +72,9 @@ describe("ZyncToken", function () {
 
     it("reverts with MintAmountZero when payment is too small for one base unit", async function () {
       const [, buyer] = await hre.ethers.getSigners();
-      const token = await deploy(hre.ethers.parseEther("1")); // 1e18 wei per full token
-      // At this price, 1 wei converts to floor(1 * 1e18 / 1e18) = 0 base units.
+      // Price above 1e18 wei per token means 1 wei buys floor(1 * 1e18 / price) = 0
+      // base units, so there is nothing to mint and the call must revert.
+      const token = await deploy(hre.ethers.parseEther("2")); // 2e18 wei per full token
       await expect(token.connect(buyer).mintWithEth({ value: 1 }))
         .to.be.revertedWithCustomError(token, "MintAmountZero");
     });
