@@ -41,6 +41,16 @@ contract ZyncToken is ERC20, Ownable, ReentrancyGuard {
     ///         to give indexers an explicit, filterable burn signal.
     event Burned(address indexed from, uint256 amount);
 
+    /// @notice Price change. Carries both old and new value so an indexer can
+    ///         reconstruct the full price history without prior state.
+    event MintPriceUpdated(uint256 previousPrice, uint256 newPrice);
+
+    /// @notice Treasury / airdrop mint (no ETH involved). `to` indexed for filtering.
+    event TreasuryMinted(address indexed to, uint256 amount);
+
+    /// @notice Sale proceeds withdrawn to the owner. `to` indexed for filtering.
+    event ProceedsWithdrawn(address indexed to, uint256 amount);
+
     constructor(uint256 initialMintPriceWei)
         ERC20("Zync", "ZYNC")
         Ownable(msg.sender)
@@ -49,11 +59,14 @@ contract ZyncToken is ERC20, Ownable, ReentrancyGuard {
         // would revert on every mint (division by zero in mintWithEth).
         if (initialMintPriceWei == 0) revert ZeroPrice();
         mintPriceWei = initialMintPriceWei;
+        emit MintPriceUpdated(0, initialMintPriceWei); // initial price is auditable too
     }
 
     function setMintPrice(uint256 newPriceWei) external onlyOwner {
         if (newPriceWei == 0) revert ZeroPrice();
+        uint256 previous = mintPriceWei; // cache before overwrite for the event
         mintPriceWei = newPriceWei;
+        emit MintPriceUpdated(previous, newPriceWei);
     }
 
     /// @notice Tokens that may still be minted over the contract's lifetime.
@@ -64,6 +77,7 @@ contract ZyncToken is ERC20, Ownable, ReentrancyGuard {
     /// @notice Treasury / airdrop mint. Counts against the lifetime cap.
     function mintTo(address to, uint256 amount) external onlyOwner {
         _mintCapped(to, amount);
+        emit TreasuryMinted(to, amount);
     }
 
     /// @notice Buy ZYNC with native ETH at the current price.
@@ -104,8 +118,10 @@ contract ZyncToken is ERC20, Ownable, ReentrancyGuard {
     }
 
     function withdraw() external onlyOwner nonReentrant {
-        (bool ok, ) = payable(owner()).call{value: address(this).balance}("");
+        uint256 amount = address(this).balance;
+        (bool ok, ) = payable(owner()).call{value: amount}("");
         if (!ok) revert WithdrawFailed();
+        emit ProceedsWithdrawn(owner(), amount);
     }
 
     /// @dev Reject bare ETH: all purchases must route through mintWithEth so the
